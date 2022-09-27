@@ -277,7 +277,9 @@ async fn create_order_payment_intent(
 ) -> Result<impl IntoResponse, AppError> {
     let payment_intent = payment_intent_for_order(&pool, id, stripe).await?;
 
-    Ok(Json(json!({ "payment_intent": payment_intent })))
+    Ok(Json(
+        json!({ "client_secret": payment_intent.client_secret }),
+    ))
 }
 
 #[derive(Clone)]
