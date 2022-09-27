@@ -1,5 +1,5 @@
 use axum::{
-    extract,
+    extract::{self, Path},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{sqlite::SqlitePool, Connection};
+use sqlx::{sqlite::SqlitePool, Connection, Sqlite};
 use std::{env, net::SocketAddr};
 use tower_http::trace::TraceLayer;
 
@@ -130,20 +130,14 @@ where
     }
 }
 
-async fn create_order(
-    extract::Json(payload): extract::Json<OrderInput>,
-    Extension(db): Extension<DB>,
-) -> Result<impl IntoResponse, AppError> {
-    let DB(pool) = db;
-
-    let OrderInput {
-        rooms_order,
-        address_details,
-    } = payload;
-
+async fn persist_order(
+    pool: impl sqlx::Acquire<'_, Database = Sqlite>,
+    rooms_order: Vec<RoomOrder>,
+    address_details: OrderAddress,
+) -> Result<i64, AppError> {
     let mut tx = pool.acquire().await?;
 
-    let order_id = tx.transaction::<_, _, anyhow::Error>(|conn| Box::pin(async move {
+    tx.transaction::<_, _, anyhow::Error>(|conn| Box::pin(async move {
         let billing_street_add = address_details.billing_street_add.unwrap_or_else(|| String::from(""));
 
         let customer_id = sqlx::query!("INSERT INTO customers (email, billing_street, billing_street_add, billing_city, billing_postcode, billing_country) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -155,7 +149,7 @@ async fn create_order(
             address_details.billing_country
         ).execute(&mut *conn).await?.last_insert_rowid();
 
-        let order_id = sqlx::query!("INSERT INTO orders (customer_id, stripe_intent_id) VALUES ($1, $2)", customer_id, "").execute(&mut *conn).await?.last_insert_rowid();
+        let order_id = sqlx::query!("INSERT INTO orders (customer_id) VALUES ($1)", customer_id).execute(&mut *conn).await?.last_insert_rowid();
 
         for order in rooms_order {
             let start_date = order.start_date.to_string();
@@ -165,17 +159,134 @@ async fn create_order(
         }
 
         Ok(order_id)
-    })).await?;
+    })).await.map_err(AppError)
+}
+
+async fn calculate_order_price(
+    tx: impl sqlx::Executor<'_, Database = Sqlite> + Copy,
+    order_id: i64,
+) -> Result<i64, AppError> {
+    let order_with_price_details = sqlx::query!(
+        "
+      SELECT
+        order_items.start_date AS start_date,
+        order_items.end_date AS end_date,
+        rooms.price_in_cents AS price
+      FROM orders
+      INNER JOIN order_items ON order_items.id = orders.id
+      INNER JOIN rooms ON order_items.room_id = rooms.id
+      WHERE orders.id = $1",
+        order_id
+    )
+    .fetch_all(tx)
+    .await?;
+
+    Ok(order_with_price_details.into_iter().fold(0, |total, r| {
+        let start_date: NaiveDate = r.start_date.parse().unwrap_or(NaiveDate::MIN);
+        let end_date: NaiveDate = r.end_date.parse().unwrap_or(NaiveDate::MIN);
+
+        if end_date == NaiveDate::MIN || start_date == NaiveDate::MIN {
+            0
+        } else {
+            let reservation_days: i64 = (end_date - start_date).num_days();
+
+            total + reservation_days * r.price
+        }
+    }))
+}
+
+async fn customer_email(
+    tx: impl sqlx::Executor<'_, Database = Sqlite> + Copy,
+    order_id: i64,
+) -> Result<String, AppError> {
+    let customer_email_record = sqlx::query!(
+        "SELECT email FROM customers INNER JOIN orders ON orders.id = $1",
+        order_id
+    )
+    .fetch_one(tx)
+    .await?;
+
+    Ok(customer_email_record.email)
+}
+
+async fn create_order(
+    extract::Json(payload): extract::Json<OrderInput>,
+    Extension(db): Extension<DB>,
+) -> Result<impl IntoResponse, AppError> {
+    let DB(pool) = db;
+
+    let OrderInput {
+        rooms_order,
+        address_details,
+    } = payload;
+
+    let order_id = persist_order(&pool, rooms_order, address_details).await?;
 
     Ok(Json(json!({ "order_id": order_id })))
 }
+
+async fn payment_intent_for_order(
+    tx: impl sqlx::Executor<'_, Database = Sqlite> + Copy,
+    order_id: i64,
+    client: stripe::Client,
+) -> Result<stripe::PaymentIntent, AppError> {
+    use stripe::{PaymentIntent, PaymentIntentId};
+
+    let payment_intent_id = sqlx::query!("SELECT payment_intent_id FROM order_payments
+        INNER JOIN orders ON orders.id = order_payments.order_id WHERE order_payments.order_id = $1", order_id).fetch_optional(tx).await?;
+
+    match payment_intent_id {
+        Some(record) => {
+            let payment_intent_id = record.payment_intent_id;
+            let payment_intent_id = payment_intent_id.parse::<PaymentIntentId>()?;
+
+            let intent = PaymentIntent::retrieve(&client, &payment_intent_id, &[]).await?;
+            Ok(intent)
+        }
+        None => {
+            use stripe::{CreatePaymentIntent, Currency};
+            let order_price = calculate_order_price(tx, order_id).await?;
+            let customer_email = customer_email(tx, order_id).await?;
+
+            let create_payload = {
+                let mut intent = CreatePaymentIntent::new(order_price, Currency::PLN);
+                intent.receipt_email = Some(&customer_email);
+                intent.payment_method_types = Some(vec![String::from("card")]);
+                intent
+            };
+
+            let payment_intent = PaymentIntent::create(&client, create_payload).await?;
+            let payment_intent_id = payment_intent.id.to_string();
+            sqlx::query!(
+                "INSERT INTO order_payments (order_id, payment_intent_id) VALUES ($1, $2)",
+                order_id,
+                payment_intent_id
+            )
+            .execute(tx)
+            .await?;
+
+            Ok(payment_intent)
+        }
+    }
+}
+
+async fn create_order_payment_intent(
+    Path(id): Path<i64>,
+    Extension(DB(pool)): Extension<DB>,
+    Extension(StripeClient(stripe)): Extension<StripeClient>,
+) -> Result<impl IntoResponse, AppError> {
+    let payment_intent = payment_intent_for_order(&pool, id, stripe).await?;
+
+    Ok(Json(json!({ "payment_intent": payment_intent })))
+}
+
+#[derive(Clone)]
+struct StripeClient(stripe::Client);
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     dotenv().ok();
     tracing_subscriber::fmt::init();
-
-    println!("{:?}", "2022-07-11".parse::<NaiveDate>());
 
     let db = DB(SqlitePool::connect(&env::var("DATABASE_URL")?).await?);
 
@@ -183,7 +294,11 @@ async fn main() -> Result<(), AppError> {
         .route("/", get(root))
         .route("/rooms", get(list_rooms))
         .route("/order", post(create_order))
+        .route("/order/:id/payment", post(create_order_payment_intent))
         .layer(Extension(db))
+        .layer(Extension(StripeClient(stripe::Client::new(env::var(
+            "STRIPE_SECRET_KEY",
+        )?))))
         .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
