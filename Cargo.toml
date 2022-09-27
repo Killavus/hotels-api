@@ -16,7 +16,7 @@ serde = { version = "1.0.145", features = ["derive"] }
 serde_json = "1.0.85"
 sqlx = { version = "0.6.2", features = ["runtime-tokio-rustls", "sqlite"] }
 tokio = { version = "1.21.1", features = ["full"] }
-tower-http = { version = "0.3.4", features = ["trace", "tracing"] }
+tower-http = { version = "0.3.4", features = ["trace", "tracing", "cors"] }
 tracing = "0.1.36"
 tracing-subscriber = { version = "0.3.15", features = ["env-filter"] }
 

@@ -1,6 +1,6 @@
 use axum::{
     extract::{self, Path},
-    http::StatusCode,
+    http::{Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{sqlite::SqlitePool, Connection, Sqlite};
 use std::{env, net::SocketAddr};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 #[derive(Clone, Debug)]
@@ -113,6 +114,8 @@ struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        tracing::warn!("Error while processing request: {}", self.0);
+
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Something went wrong: {}", self.0),
@@ -301,10 +304,19 @@ async fn main() -> Result<(), AppError> {
         .layer(Extension(StripeClient(stripe::Client::new(env::var(
             "STRIPE_SECRET_KEY",
         )?))))
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_headers(Any)
+                .allow_methods([Method::GET, Method::POST]),
+        );
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::info!("Server starting on port {}", 3000);
+    let addr: SocketAddr = env::var("APP_LISTEN")
+        .unwrap_or_else(|_| String::from("127.0.0.1:9999"))
+        .parse()?;
+
+    tracing::info!("Server starting, listening on {}", addr);
 
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
